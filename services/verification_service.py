@@ -1,21 +1,36 @@
-import os
 import asyncio
-import wave
-import audioop
+import math
+import os
 import struct
-from pathlib import Path
-from typing import Dict
-from functools import partial
+import tempfile
 from datetime import datetime
+from functools import partial
+from pathlib import Path
+from typing import Dict, Tuple
 
 import discord
 
+from config.settings import settings
 from models.verification_session import VerificationSession, VerificationStatus
 from services.audio_service import AudioService
 from services.recording_service import RecordingService
 from services.role_service import RoleService
 from utils.logger import logger
-from config.settings import settings
+
+try:
+    import librosa
+    import numpy as np
+    HAS_LIBROSA = True
+except ImportError:
+    HAS_LIBROSA = False
+    librosa = None
+    np = None  # Добавь это, чтобы избежать NameError
+
+try:
+    from pydub import AudioSegment
+    HAS_PYDUB = True
+except ImportError:
+    HAS_PYDUB = False
 
 
 class VerificationService:
@@ -103,24 +118,180 @@ class VerificationService:
             logger.error(f"Ошибка при отправке вопроса: {e}")
             await self._handle_verification_error(text_channel, session, str(e))
 
-    async def _analyze_audio_file(self, filepath: str, expected_duration: int) -> dict:
-        """Улучшенный анализ аудиофайла с proper handling"""
+    async def _convert_to_pcm16(self, input_path: str, output_path: str) -> bool:
+        """Конвертировать аудио в PCM16 формат с помощью ffmpeg"""
+        try:
+            process = await asyncio.create_subprocess_exec(
+                "ffmpeg", "-y", "-i", input_path,
+                "-ar", "44100", "-ac", "1", "-sample_fmt", "s16",
+                output_path,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL
+            )
+            await process.wait()
+            return process.returncode == 0
+        except Exception as e:
+            logger.warning(f"FFmpeg conversion failed: {e}")
+            return False
+
+    def _interpret_rms(self, rms: float) -> Tuple[str, str, int]:
+        """Интерпретировать RMS значение в удобочитаемый формат"""
+        if rms <= 0.0:
+            return "0.0000", "🔴 Тишина", 5
         
-        # Defaults
+        try:
+            db = 20 * math.log10(rms + 1e-10)  # dBFS громкость
+            rms_str = f"{rms:.4f}"
+            
+            if db < -40:
+                return rms_str, "🔴 Очень тихо", 15
+            elif db < -30:
+                return rms_str, "🟡 Тихо", 35
+            elif db < -20:
+                return rms_str, "🟢 Нормально", 70
+            elif db < -10:
+                return rms_str, "🟢 Громко", 85
+            else:
+                return rms_str, "🟦 Очень громко", 90
+        except Exception:
+            return f"{rms:.4f}", "🟡 Неопределенно", 50
+
+    async def _analyze_with_librosa(self, file_path: str) -> Dict:
+        """Анализ аудио с помощью librosa (наиболее точный)"""
+        try:
+            # Создаем временный файл для конвертации
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_file:
+                temp_path = tmp_file.name
+
+            # Конвертируем в совместимый формат
+            if not await self._convert_to_pcm16(file_path, temp_path):
+                os.unlink(temp_path)
+                raise Exception("FFmpeg conversion failed")
+
+            # Загружаем аудио
+            y, sr = librosa.load(temp_path, sr=None, mono=True)
+            
+            # Вычисляем метрики
+            duration = len(y) / sr
+            rms = float(librosa.feature.rms(y=y).mean())
+            
+            # Очищаем временный файл
+            os.unlink(temp_path)
+            
+            return {
+                'duration': duration,
+                'sample_rate': sr,
+                'rms': rms,
+                'method': 'librosa'
+            }
+            
+        except Exception as e:
+            if 'temp_path' in locals() and os.path.exists(temp_path):
+                os.unlink(temp_path)
+            raise Exception(f"Librosa analysis failed: {e}")
+
+    async def _analyze_with_pydub(self, file_path: str) -> Dict:
+        """Анализ аудио с помощью pydub (средний уровень точности)"""
+        try:
+            # Пытаемся загрузить напрямую
+            try:
+                audio = AudioSegment.from_wav(file_path)
+            except Exception:
+                # Если не получается, конвертируем через ffmpeg
+                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_file:
+                    temp_path = tmp_file.name
+                
+                if not await self._convert_to_pcm16(file_path, temp_path):
+                    os.unlink(temp_path)
+                    raise Exception("FFmpeg conversion failed")
+                
+                audio = AudioSegment.from_wav(temp_path)
+                os.unlink(temp_path)
+
+            duration = len(audio) / 1000.0  # в секундах
+            sample_rate = audio.frame_rate
+            
+            # Простой расчет RMS
+            samples = audio.get_array_of_samples()
+            if len(samples) > 0:
+                rms = math.sqrt(sum(x*x for x in samples) / len(samples)) / 32768.0
+            else:
+                rms = 0.0
+
+            return {
+                'duration': duration,
+                'sample_rate': sample_rate,
+                'rms': rms,
+                'method': 'pydub'
+            }
+            
+        except Exception as e:
+            raise Exception(f"Pydub analysis failed: {e}")
+
+    async def _analyze_with_ffprobe(self, file_path: str) -> Dict:
+        """Анализ аудио с помощью ffprobe (базовый уровень)"""
+        try:
+            # Получаем информацию о файле
+            process = await asyncio.create_subprocess_exec(
+                "ffprobe", "-v", "quiet", "-print_format", "json", 
+                "-show_format", "-show_streams", file_path,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await process.communicate()
+            
+            if process.returncode != 0:
+                raise Exception(f"ffprobe failed: {stderr.decode()}")
+            
+            import json
+            data = json.loads(stdout.decode())
+            
+            duration = 0.0
+            sample_rate = 48000
+            
+            # Извлекаем информацию о формате
+            if 'format' in data and 'duration' in data['format']:
+                duration = float(data['format']['duration'])
+            
+            # Извлекаем информацию о потоке
+            if 'streams' in data and len(data['streams']) > 0:
+                stream = data['streams'][0]
+                if 'sample_rate' in stream:
+                    sample_rate = int(stream['sample_rate'])
+            
+            # Оценка RMS на основе размера файла (очень приблизительно)
+            file_size = os.path.getsize(file_path)
+            estimated_rms = min(0.1, max(0.001, file_size / (duration * 100000))) if duration > 0 else 0.001
+
+            return {
+                'duration': duration,
+                'sample_rate': sample_rate,
+                'rms': estimated_rms,
+                'method': 'ffprobe'
+            }
+            
+        except Exception as e:
+            raise Exception(f"FFprobe analysis failed: {e}")
+
+    async def _analyze_audio_file(self, filepath: str, expected_duration: int) -> dict:
+        """Улучшенный анализ аудиофайла с каскадным подходом"""
+        
+        # Базовые значения по умолчанию
         result = {
             'duration': 0.0,
             'file_size_kb': 0.0,
             'avg_volume': 0,
             'sample_rate': 48000,
-            'quality': 0,
+            'quality': 5,
             'quality_emoji': '🔴',
             'quality_color': 0xe74c3c,
             'channels': 2,
-            'sample_width': 2
+            'sample_width': 2,
+            'analysis_method': 'fallback'
         }
         
         try:
-            # File size check
+            # Проверка существования файла
             if not os.path.exists(filepath):
                 logger.warning(f"Audio file not found: {filepath}")
                 return result
@@ -128,60 +299,100 @@ class VerificationService:
             file_size = os.path.getsize(filepath)
             result['file_size_kb'] = file_size / 1024
             
-            # Too small file check
-            if file_size < 1024:  # Less than 1KB
+            # Проверка минимального размера
+            if file_size < 1024:  # Меньше 1KB
                 logger.warning(f"Audio file too small: {file_size} bytes")
-                result['quality'] = 5
+                result['quality'] = 10
                 return result
             
-            # Wait for file to be fully written
+            # Ждем завершения записи файла
             await asyncio.sleep(0.5)
             
-            # Primary analysis with wave module
-            try:
-                with wave.open(filepath, 'rb') as wf:
-                    frames = wf.getnframes()
-                    result['sample_rate'] = wf.getframerate()
-                    result['channels'] = wf.getnchannels()
-                    result['sample_width'] = wf.getsampwidth()
-                    
-                    # Calculate duration
-                    if frames > 0 and result['sample_rate'] > 0:
-                        result['duration'] = frames / result['sample_rate']
-                    
-                    # Volume analysis - read up to 5 seconds of audio
-                    max_frames = min(frames, result['sample_rate'] * 5)
-                    if max_frames > 0:
-                        audio_data = wf.readframes(max_frames)
-                        if len(audio_data) > 0:
-                            try:
-                                result['avg_volume'] = audioop.rms(audio_data, result['sample_width'])
-                            except audioop.error as e:
-                                logger.warning(f"RMS calculation failed: {e}")
-                                # Fallback: manual RMS calculation
-                                result['avg_volume'] = self._calculate_manual_rms(audio_data, result['sample_width'])
-                                
-            except (wave.Error, OSError) as e:
-                logger.warning(f"Wave analysis failed: {e}")
-                # Fallback to file-based estimation
-                result.update(self._estimate_audio_properties(filepath, file_size))
+            # Каскадный анализ: пробуем методы от лучшего к худшему
+            analysis_result = None
             
-            # Quality calculation
+            # 1. Пробуем librosa (самый точный)
+            if HAS_LIBROSA:
+                try:
+                    logger.debug("Trying librosa analysis...")
+                    analysis_result = await self._analyze_with_librosa(filepath)
+                    logger.info("✅ Librosa analysis successful")
+                except Exception as e:
+                    logger.debug(f"Librosa failed: {e}")
+            
+            # 2. Пробуем pydub (средний уровень)
+            if not analysis_result and HAS_PYDUB:
+                try:
+                    logger.debug("Trying pydub analysis...")
+                    analysis_result = await self._analyze_with_pydub(filepath)
+                    logger.info("✅ Pydub analysis successful")
+                except Exception as e:
+                    logger.debug(f"Pydub failed: {e}")
+            
+            # 3. Пробуем ffprobe (базовый уровень)
+            if not analysis_result:
+                try:
+                    logger.debug("Trying ffprobe analysis...")
+                    analysis_result = await self._analyze_with_ffprobe(filepath)
+                    logger.info("✅ FFprobe analysis successful")
+                except Exception as e:
+                    logger.debug(f"FFprobe failed: {e}")
+            
+            # Если все методы не сработали, используем fallback
+            if not analysis_result:
+                logger.warning("All analysis methods failed, using fallback estimation")
+                result.update(self._estimate_audio_properties(filepath, file_size))
+                result['analysis_method'] = 'fallback_estimation'
+            else:
+                # Обновляем результат данными анализа
+                result['duration'] = analysis_result['duration']
+                result['sample_rate'] = analysis_result['sample_rate']
+                result['avg_volume'] = int(analysis_result['rms'] * 10000)  # Приводим к интегральному RMS
+                result['analysis_method'] = analysis_result['method']
+            
+            # Интерпретируем RMS
+            rms_str, rms_label, rms_quality = self._interpret_rms(analysis_result['rms'] if analysis_result else 0.001)
+            result['rms_string'] = rms_str
+            result['rms_label'] = rms_label
+            
+            # Вычисляем качество
             result.update(self._calculate_quality_metrics(result, expected_duration))
             
-            logger.info(f"Audio analysis: {result['duration']:.1f}s, {result['avg_volume']} RMS, {result['quality']}%")
+            logger.info(f"🎵 Audio analysis complete: {result['duration']:.1f}s, {result['quality']}%, method: {result['analysis_method']}")
             
         except Exception as e:
-            logger.error(f"Audio analysis failed completely: {e}")
-            # Minimal fallback
+            logger.error(f"❌ Complete audio analysis failure: {e}")
+            # Аварийный fallback
             result['duration'] = max(1.0, expected_duration * 0.5)
-            result['quality'] = 20
+            result['quality'] = 25
+            result['analysis_method'] = 'emergency_fallback'
             
         return result
+
+    def _estimate_volume_from_file_size(self, file_size: int, duration: float) -> int:
+        """Оценка громкости на основе размера файла"""
+        if duration <= 0:
+            return 1000
+        
+        # Примерная оценка: больше файл = больше данных = больше звука
+        bytes_per_second = file_size / duration if duration > 0 else file_size
+        
+        # Эмпирическая формула для Discord WAV файлов
+        if bytes_per_second < 50000:  # Очень тихо
+            return 500
+        elif bytes_per_second < 100000:  # Тихо
+            return 1500
+        elif bytes_per_second < 150000:  # Нормально
+            return 3000
+        else:  # Громко
+            return 5000
 
     def _calculate_manual_rms(self, audio_data: bytes, sample_width: int) -> int:
         """Manual RMS calculation as fallback"""
         try:
+            if len(audio_data) < sample_width:
+                return 0
+                
             if sample_width == 1:
                 # 8-bit unsigned
                 samples = [abs(b - 128) for b in audio_data]
@@ -189,14 +400,16 @@ class VerificationService:
                 # 16-bit signed
                 samples = []
                 for i in range(0, len(audio_data) - 1, 2):
-                    sample = struct.unpack('<h', audio_data[i:i+2])[0]
-                    samples.append(abs(sample))
+                    if i + 1 < len(audio_data):
+                        sample = struct.unpack('<h', audio_data[i:i+2])[0]
+                        samples.append(abs(sample))
             elif sample_width == 4:
                 # 32-bit signed
                 samples = []
                 for i in range(0, len(audio_data) - 3, 4):
-                    sample = struct.unpack('<i', audio_data[i:i+4])[0]
-                    samples.append(abs(sample))
+                    if i + 3 < len(audio_data):
+                        sample = struct.unpack('<i', audio_data[i:i+4])[0]
+                        samples.append(abs(sample))
             else:
                 return 1000  # Default fallback
                 
@@ -218,14 +431,14 @@ class VerificationService:
         estimated_channels = 2
         estimated_sample_width = 2
         
-        # Estimate duration based on file size
+        # ИСПРАВЛЕНО: Более точная оценка длительности
         # WAV header is ~44 bytes, rest is audio data
         audio_data_size = max(0, file_size - 44)
         bytes_per_second = estimated_sample_rate * estimated_channels * estimated_sample_width
         estimated_duration = audio_data_size / bytes_per_second if bytes_per_second > 0 else 1.0
         
-        # Estimate volume based on file size vs duration ratio
-        estimated_volume = min(5000, max(500, int(file_size / 100)))
+        # ИСПРАВЛЕНО: Более реалистичная оценка громкости
+        estimated_volume = self._estimate_volume_from_file_size(file_size, estimated_duration)
         
         return {
             'duration': estimated_duration,
@@ -242,59 +455,58 @@ class VerificationService:
         file_size_kb = audio_data['file_size_kb']
         avg_volume = audio_data['avg_volume']
         
-        # Duration score (0-1)
+        # ИСПРАВЛЕНО: Более справедливая оценка длительности
         if expected_duration > 0:
             duration_ratio = duration / expected_duration
-            # Penalize too short or too long recordings
-            if duration_ratio < 0.3:
-                duration_score = duration_ratio / 0.3 * 0.5  # Severe penalty for very short
-            elif duration_ratio > 1.5:
-                duration_score = max(0.5, 1.0 - (duration_ratio - 1.5) * 0.5)  # Penalty for too long
+            # Более мягкие штрафы
+            if duration_ratio < 0.5:
+                duration_score = duration_ratio / 0.5 * 0.7  # Менее жесткий штраф
+            elif duration_ratio > 1.2:
+                duration_score = max(0.7, 1.0 - (duration_ratio - 1.2) * 0.3)  # Мягче для длинных
             else:
                 duration_score = 1.0  # Perfect range
         else:
             duration_score = 0.8 if duration > 1.0 else 0.3
         
-        # File size score (0-1)
-        expected_size_kb = expected_duration * 12  # ~12KB per second for Discord quality
+        # ИСПРАВЛЕНО: Более реалистичная оценка размера файла
+        expected_size_kb = expected_duration * 15  # ~15KB per second более реалистично
         if expected_size_kb > 0:
             size_ratio = file_size_kb / expected_size_kb
-            if size_ratio < 0.2:
-                size_score = 0.1  # Too small
-            elif size_ratio > 3.0:
-                size_score = 0.7  # Too large but not necessarily bad
+            if size_ratio < 0.3:
+                size_score = size_ratio / 0.3 * 0.6  # Штраф за маленький размер
+            elif size_ratio > 2.0:
+                size_score = 0.8  # Большой файл не всегда плохо
             else:
-                size_score = min(1.0, size_ratio)
+                size_score = 1.0
         else:
-            size_score = 0.5 if file_size_kb > 10 else 0.1
+            size_score = 0.7 if file_size_kb > 20 else 0.3
         
-        # Volume score (0-1)
+        # ИСПРАВЛЕНО: Более адекватная оценка громкости
         if avg_volume > 0:
-            # Volume ranges: 0-1000 (silence), 1000-5000 (normal), 5000+ (loud)
-            if avg_volume < 200:
-                volume_score = 0.1  # Too quiet/silence
-            elif avg_volume < 1000:
-                volume_score = avg_volume / 1000 * 0.6  # Quiet but audible
-            elif avg_volume < 8000:
-                volume_score = 0.6 + (avg_volume - 1000) / 7000 * 0.4  # Normal range
+            if avg_volume < 500:
+                volume_score = 0.2  # Очень тихо
+            elif avg_volume < 1500:
+                volume_score = 0.6  # Тихо но слышно
+            elif avg_volume < 6000:
+                volume_score = 1.0  # Нормальный диапазон
             else:
-                volume_score = 1.0  # Loud enough
+                volume_score = 0.9  # Очень громко, но не критично
         else:
-            volume_score = 0.1  # No audio detected
+            volume_score = 0.1  # Тишина
         
-        # Combined quality score
-        # Weights: duration 50%, volume 35%, size 15%
-        quality = int((duration_score * 0.5 + volume_score * 0.35 + size_score * 0.15) * 100)
-        quality = max(5, min(100, quality))  # Clamp between 5-100
+        # ИСПРАВЛЕНО: Более сбалансированные веса
+        # Weights: duration 40%, volume 40%, size 20%
+        quality = int((duration_score * 0.4 + volume_score * 0.4 + size_score * 0.2) * 100)
+        quality = max(10, min(100, quality))  # Clamp between 10-100
         
         # Quality indicators
-        if quality >= 85:
+        if quality >= 80:
             quality_emoji = "🟢"
             quality_color = 0x27ae60
-        elif quality >= 70:
+        elif quality >= 60:
             quality_emoji = "🟡"
             quality_color = 0xf39c12
-        elif quality >= 50:
+        elif quality >= 40:
             quality_emoji = "🟠"
             quality_color = 0xe67e22
         else:
@@ -314,10 +526,20 @@ class VerificationService:
         try:
             guild = text_channel.guild
             saved_files = await self.recording_service.save_audio_files(sink, guild)
-
+            
+            # ИСПРАВЛЕНО: Обрабатываем все файлы, но отправляем сводку
+            total_files_processed = 0
+            session_user_file = None
+            
+            # Находим файл текущего пользователя
             for file_info in saved_files:
-                member = file_info['member']
-                filepath = file_info['filepath']
+                if file_info['user_id'] == session.user_id:
+                    session_user_file = file_info
+                    break
+            
+            if session_user_file:
+                member = session_user_file['member']
+                filepath = session_user_file['filepath']
                 filename = Path(filepath).name
                 
                 # Improved audio analysis
@@ -327,6 +549,7 @@ class VerificationService:
                 # 📊 АНАЛИТИЧЕСКИЙ ЭМБЕД ДЛЯ САППОРТОВ
                 progress = session.current_question_index + 1
                 total = len(settings.questions)
+                total_files_processed = len(saved_files)
                 
                 embed = discord.Embed(
                     title=f"✅ Запись {progress}/{total} завершена",
@@ -342,8 +565,8 @@ class VerificationService:
                 )
 
                 embed.add_field(
-                    name="📁 Файл",
-                    value=f"`{filename}`",
+                    name="📁 Файлы",
+                    value=f"`{filename}`\n*+{total_files_processed-1} других*" if total_files_processed > 1 else f"`{filename}`",
                     inline=True
                 )
 
@@ -362,7 +585,7 @@ class VerificationService:
                 )
 
                 embed.set_thumbnail(url=member.display_avatar.url)
-                embed.set_footer(text=f"ID: {member.id} • Осталось: {total - progress}")
+                embed.set_footer(text=f"ID: {member.id} • Файлов записано: {total_files_processed}")
 
                 await text_channel.send(embed=embed)
                 
@@ -370,7 +593,13 @@ class VerificationService:
                 await text_channel.send(f"📎 **Аудиофайл:** `{filename}` • {audio_analysis['quality']}% качества", file=discord.File(filepath))
 
                 logger.success(f"🎙️ {member.display_name} — Q{progress}: {audio_analysis['quality']}% ({filename})")
-                os.remove(filepath)
+            
+            # Удаляем все файлы после обработки
+            for file_info in saved_files:
+                try:
+                    os.remove(file_info['filepath'])
+                except OSError as e:
+                    logger.warning(f"Couldn't remove file {file_info['filepath']}: {e}")
 
             if session.current_question_index + 1 < len(settings.questions):
                 session.next_question()
@@ -387,21 +616,22 @@ class VerificationService:
                 
                 await self._ask_question(voice_client, text_channel, session)
             else:
-                await self._complete_verification(voice_client, text_channel, session, saved_files)
+                # ИСПРАВЛЕНО: Передаем корректное количество файлов
+                await self._complete_verification(voice_client, text_channel, session, total_files_processed)
 
         except Exception as e:
             logger.error(f"Ошибка при завершении записи: {e}")
             await self._handle_verification_error(text_channel, session, str(e))
 
-    async def _complete_verification(self, voice_client: discord.VoiceClient, text_channel: discord.TextChannel, session: VerificationSession, saved_files: list):
+    async def _complete_verification(self, voice_client: discord.VoiceClient, text_channel: discord.TextChannel, session: VerificationSession, total_files_count: int):
         try:
             await self.audio_service.play_audio_file(voice_client, settings.audio_files["completion"])
 
-            for file_info in saved_files:
-                member = file_info['member']
+            member = voice_client.guild.get_member(session.user_id)
+            if member:
                 await self.role_service.assign_verified_role(member, settings.verified_role_id, settings.unverified_role_id)
 
-                # 🎉 ФИНАЛЬНЫЙ ОТЧЕТ ДЛЯ САППОРТОВ
+                # 🎉 ИСПРАВЛЕННЫЙ ФИНАЛЬНЫЙ ОТЧЕТ
                 embed = discord.Embed(
                     title="🎉 Верификация завершена успешно",
                     description=f"**{member.mention}** • `{member.id}`\n✅ **Все {len(settings.questions)} вопросов пройдены**",
@@ -409,9 +639,10 @@ class VerificationService:
                     timestamp=datetime.utcnow()
                 )
 
+                # ИСПРАВЛЕНО: Показываем правильное количество файлов
                 embed.add_field(
                     name="📊 Статистика",
-                    value=f"```yaml\nВопросов: {len(settings.questions)}/{len(settings.questions)}\nВремя: {sum(settings.recording_durations)}с\nФайлов: {len(saved_files)}\nУспех: 100%```",
+                    value=f"```yaml\nВопросов: {len(settings.questions)}/{len(settings.questions)}\nВремя: {sum(settings.recording_durations)}с\nФайлов: {len(settings.questions)}\nУспех: 100%```",
                     inline=False
                 )
 

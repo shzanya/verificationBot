@@ -1,1 +1,2 @@
 # verificationBot
+DISCORD_TOKEN=
