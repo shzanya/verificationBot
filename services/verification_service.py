@@ -369,23 +369,34 @@ class VerificationService:
             
         return result
 
-    def _estimate_volume_from_file_size(self, file_size: int, duration: float) -> int:
-        """Оценка громкости на основе размера файла"""
+    def _estimate_volume_from_file_size(self, file_size: int, duration: float, expected_duration: int) -> int:
+        """Улучшенная оценка громкости с учетом ожидаемой длительности"""
         if duration <= 0:
-            return 1000
+            return 800 if expected_duration <= 3 else 1000
         
-        # Примерная оценка: больше файл = больше данных = больше звука
-        bytes_per_second = file_size / duration if duration > 0 else file_size
+        bytes_per_second = file_size / duration
         
-        # Эмпирическая формула для Discord WAV файлов
-        if bytes_per_second < 50000:  # Очень тихо
-            return 500
-        elif bytes_per_second < 100000:  # Тихо
-            return 1500
-        elif bytes_per_second < 150000:  # Нормально
-            return 3000
-        else:  # Громко
-            return 5000
+        # Адаптивные пороги в зависимости от ожидаемой длительности
+        if expected_duration <= 3:
+            # Для коротких ответов более мягкие требования
+            if bytes_per_second < 30000:
+                return 400
+            elif bytes_per_second < 60000:
+                return 1000
+            elif bytes_per_second < 100000:
+                return 2000
+            else:
+                return 3500
+        else:
+            # Для длинных ответов стандартные требования
+            if bytes_per_second < 50000:
+                return 500
+            elif bytes_per_second < 100000:
+                return 1500
+            elif bytes_per_second < 150000:
+                return 3000
+            else:
+                return 5000
 
     def _calculate_manual_rms(self, audio_data: bytes, sample_width: int) -> int:
         """Manual RMS calculation as fallback"""
@@ -424,24 +435,26 @@ class VerificationService:
             logger.warning(f"Manual RMS calculation failed: {e}")
             return 1000  # Safe fallback
 
-    def _estimate_audio_properties(self, filepath: str, file_size: int) -> dict:
-        """Estimate audio properties when wave analysis fails"""
-        # Basic estimates for common Discord audio format
+    def _estimate_audio_properties(self, filepath: str, file_size: int, expected_duration: int = 3) -> dict:
+        """Улучшенная оценка свойств аудио с учетом ожидаемой длительности"""
         estimated_sample_rate = 48000
         estimated_channels = 2
         estimated_sample_width = 2
         
-        # ИСПРАВЛЕНО: Более точная оценка длительности
-        # WAV header is ~44 bytes, rest is audio data
+        # Более точная оценка длительности
         audio_data_size = max(0, file_size - 44)
         bytes_per_second = estimated_sample_rate * estimated_channels * estimated_sample_width
-        estimated_duration = audio_data_size / bytes_per_second if bytes_per_second > 0 else 1.0
+        estimated_duration_calc = audio_data_size / bytes_per_second if bytes_per_second > 0 else 1.0
         
-        # ИСПРАВЛЕНО: Более реалистичная оценка громкости
-        estimated_volume = self._estimate_volume_from_file_size(file_size, estimated_duration)
+        # Ограничиваем оценку разумными пределами
+        if expected_duration <= 3:
+            estimated_duration_calc = min(estimated_duration_calc, expected_duration * 2)
+        
+        # Улучшенная оценка громкости
+        estimated_volume = self._estimate_volume_from_file_size(file_size, estimated_duration_calc, expected_duration)
         
         return {
-            'duration': estimated_duration,
+            'duration': estimated_duration_calc,
             'sample_rate': estimated_sample_rate,
             'channels': estimated_channels,
             'sample_width': estimated_sample_width,
@@ -449,69 +462,122 @@ class VerificationService:
         }
 
     def _calculate_quality_metrics(self, audio_data: dict, expected_duration: int) -> dict:
-        """Calculate quality score and related metrics"""
+        """Calculate quality score with adaptive scoring based on expected duration"""
         
         duration = audio_data['duration']
         file_size_kb = audio_data['file_size_kb']
         avg_volume = audio_data['avg_volume']
         
-        # ИСПРАВЛЕНО: Более справедливая оценка длительности
+        # ИСПРАВЛЕНО: Адаптивная оценка длительности
         if expected_duration > 0:
             duration_ratio = duration / expected_duration
-            # Более мягкие штрафы
-            if duration_ratio < 0.5:
-                duration_score = duration_ratio / 0.5 * 0.7  # Менее жесткий штраф
-            elif duration_ratio > 1.2:
-                duration_score = max(0.7, 1.0 - (duration_ratio - 1.2) * 0.3)  # Мягче для длинных
+            
+            # Для коротких ответов (≤3 сек) - более мягкие требования
+            if expected_duration <= 3:
+                if duration_ratio >= 0.3:  # Минимум 30% от ожидаемого
+                    if duration_ratio <= 2.0:  # Максимум в 2 раза больше
+                        duration_score = 1.0
+                    else:
+                        duration_score = max(0.7, 1.0 - (duration_ratio - 2.0) * 0.2)
+                else:
+                    # Очень короткие ответы - мягкий штраф
+                    duration_score = duration_ratio / 0.3 * 0.8
+            
+            # Для длинных ответов (>3 сек) - стандартные требования
             else:
-                duration_score = 1.0  # Perfect range
+                if duration_ratio >= 0.6:  # Минимум 60% от ожидаемого
+                    if duration_ratio <= 1.3:  # До 130% - отлично
+                        duration_score = 1.0
+                    else:
+                        duration_score = max(0.8, 1.0 - (duration_ratio - 1.3) * 0.3)
+                else:
+                    duration_score = duration_ratio / 0.6 * 0.7
         else:
-            duration_score = 0.8 if duration > 1.0 else 0.3
+            duration_score = 0.8 if duration > 0.5 else 0.3
         
-        # ИСПРАВЛЕНО: Более реалистичная оценка размера файла
-        expected_size_kb = expected_duration * 15  # ~15KB per second более реалистично
+        # ИСПРАВЛЕНО: Адаптивная оценка размера файла
+        # Базовая оценка: 12-18 KB/сек для коротких записей, 15-20 KB/сек для длинных
+        if expected_duration <= 3:
+            expected_size_kb = expected_duration * 12  # Меньше ожидаемый размер для коротких
+            min_acceptable_ratio = 0.2  # Более мягкие требования
+        else:
+            expected_size_kb = expected_duration * 15
+            min_acceptable_ratio = 0.3
+        
         if expected_size_kb > 0:
             size_ratio = file_size_kb / expected_size_kb
-            if size_ratio < 0.3:
-                size_score = size_ratio / 0.3 * 0.6  # Штраф за маленький размер
-            elif size_ratio > 2.0:
-                size_score = 0.8  # Большой файл не всегда плохо
+            if size_ratio >= min_acceptable_ratio:
+                if size_ratio <= 2.5:
+                    size_score = 1.0
+                else:
+                    size_score = 0.8  # Большой файл не критично
             else:
-                size_score = 1.0
+                size_score = size_ratio / min_acceptable_ratio * 0.6
         else:
-            size_score = 0.7 if file_size_kb > 20 else 0.3
+            size_score = 0.7 if file_size_kb > 10 else 0.3
         
-        # ИСПРАВЛЕНО: Более адекватная оценка громкости
+        # ИСПРАВЛЕНО: Адаптивная оценка громкости
         if avg_volume > 0:
-            if avg_volume < 500:
-                volume_score = 0.2  # Очень тихо
-            elif avg_volume < 1500:
-                volume_score = 0.6  # Тихо но слышно
-            elif avg_volume < 6000:
-                volume_score = 1.0  # Нормальный диапазон
+            # Для коротких ответов требования к громкости мягче
+            if expected_duration <= 3:
+                if avg_volume >= 300:  # Минимальный порог для коротких
+                    if avg_volume <= 8000:
+                        volume_score = 1.0
+                    else:
+                        volume_score = 0.9
+                else:
+                    volume_score = max(0.4, avg_volume / 300 * 0.8)
             else:
-                volume_score = 0.9  # Очень громко, но не критично
+                # Для длинных ответов стандартные требования
+                if avg_volume >= 500:
+                    if avg_volume <= 6000:
+                        volume_score = 1.0
+                    else:
+                        volume_score = 0.9
+                else:
+                    volume_score = max(0.3, avg_volume / 500 * 0.7)
         else:
-            volume_score = 0.1  # Тишина
+            volume_score = 0.1  # Тишина всегда плохо
         
-        # ИСПРАВЛЕНО: Более сбалансированные веса
-        # Weights: duration 40%, volume 40%, size 20%
-        quality = int((duration_score * 0.4 + volume_score * 0.4 + size_score * 0.2) * 100)
-        quality = max(10, min(100, quality))  # Clamp between 10-100
-        
-        # Quality indicators
-        if quality >= 80:
-            quality_emoji = "🟢"
-            quality_color = 0x27ae60
-        elif quality >= 60:
-            quality_emoji = "🟡"
-            quality_color = 0xf39c12
-        elif quality >= 40:
-            quality_emoji = "🟠"
-            quality_color = 0xe67e22
+        # ИСПРАВЛЕНО: Адаптивные веса в зависимости от длительности
+        if expected_duration <= 3:
+            # Для коротких ответов: громкость важнее длительности
+            quality = int((duration_score * 0.3 + volume_score * 0.5 + size_score * 0.2) * 100)
         else:
-            quality_emoji = "🔴"
-            quality_color = 0xe74c3c
+            # Для длинных ответов: сбалансированно
+            quality = int((duration_score * 0.4 + volume_score * 0.4 + size_score * 0.2) * 100)
+        
+        quality = max(15, min(100, quality))  # Минимум 15% для любого ответа
+        
+        # ИСПРАВЛЕНО: Адаптивные пороги качества
+        if expected_duration <= 3:
+            # Для коротких ответов более мягкие пороги
+            if quality >= 70:
+                quality_emoji = "🟢"
+                quality_color = 0x27ae60
+            elif quality >= 50:
+                quality_emoji = "🟡"
+                quality_color = 0xf39c12
+            elif quality >= 30:
+                quality_emoji = "🟠"
+                quality_color = 0xe67e22
+            else:
+                quality_emoji = "🔴"
+                quality_color = 0xe74c3c
+        else:
+            # Для длинных ответов стандартные пороги
+            if quality >= 80:
+                quality_emoji = "🟢"
+                quality_color = 0x27ae60
+            elif quality >= 60:
+                quality_emoji = "🟡"
+                quality_color = 0xf39c12
+            elif quality >= 40:
+                quality_emoji = "🟠"
+                quality_color = 0xe67e22
+            else:
+                quality_emoji = "🔴"
+                quality_color = 0xe74c3c
         
         return {
             'quality': quality,
@@ -519,7 +585,9 @@ class VerificationService:
             'quality_color': quality_color,
             'duration_score': duration_score,
             'size_score': size_score,
-            'volume_score': volume_score
+            'volume_score': volume_score,
+            'expected_duration': expected_duration,
+            'is_short_answer': expected_duration <= 3
         }
 
     async def _handle_recording_complete(self, sink, text_channel: discord.TextChannel, voice_client: discord.VoiceClient, session: VerificationSession):
