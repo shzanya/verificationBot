@@ -1,1 +1,66 @@
+# 🔐 Секреты
 .env
+.env.*
+
+# 🐍 Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+.mypy_cache/
+.pytest_cache/
+.cache/
+pip-log.txt
+
+# 📦 Пакеты и окружение
+venv/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# 📂 Базы данных, временные файлы
+*.db
+*.sqlite3
+*.log
+*.tmp
+*.bak
+*.swp
+*.pid
+
+# 🎧 Аудиофайлы и кэш анализа
+*.wav
+*.mp3
+*.ogg
+*.flac
+librosa_cache/
+audio_cache/
+*.npy
+
+# ⚙️ IDE и редакторы
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# 🧪 Тесты
+.coverage
+htmlcov/
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.tox/
+.test/
+tests/__pycache__/
+
+# 💻 OS файлы
+.DS_Store
+Thumbs.db
