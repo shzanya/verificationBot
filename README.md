@@ -374,6 +374,4 @@ copies or substantial portions of the Software.
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Last Commit](https://img.shields.io/github/last-commit/shzanya/verificationBot?color=blue)](https://github.com/shzanya/verificationBot/commits/main)
 
-[⬆️ Наверх](#-discord-voice-verification-bot)
-
 </div>
