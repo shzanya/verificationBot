@@ -1,0 +1,12 @@
+# Discord.py with voice support
+discord.py[voice]>=2.3.0
+
+# Rich for beautiful console output
+rich>=13.0.0
+
+# Environment variables
+python-dotenv>=1.0.0
+
+# Audio processing
+PyNaCl>=1.5.0
+FFmpeg-python>=0.2.0
